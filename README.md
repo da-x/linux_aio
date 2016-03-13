@@ -32,7 +32,7 @@ fn main() {
 }
 ```
 
-For more examples, see [examples/*.rs] files.
+For more examples, see "examples/*.rs" files.
 
 References
 ----------
