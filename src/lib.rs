@@ -69,7 +69,7 @@ impl ControlBlock {
     pub fn pread(fd: RawFd, mut buf: AlignedBuf, offset: usize) -> Self {
         let mut iocb = c_api::iocb::zeroed();
         iocb.aio_fildes = fd as libc::uint32_t;
-        iocb.aio_lib_opcode = c_api::IOCB_CMD::PREAD;
+        iocb.aio_lio_opcode = c_api::IOCB_CMD::PREAD;
         iocb.aio_buf = unsafe { std::mem::transmute(buf.as_mut_ptr()) };
         iocb.aio_nbytes = buf.size as libc::uint64_t;
         iocb.aio_offset = offset as libc::int64_t;
@@ -82,7 +82,7 @@ impl ControlBlock {
     pub fn pwrite(fd: RawFd, buf: AlignedBuf, offset: usize) -> Self {
         let mut iocb = c_api::iocb::zeroed();
         iocb.aio_fildes = fd as libc::uint32_t;
-        iocb.aio_lib_opcode = c_api::IOCB_CMD::PWRITE;
+        iocb.aio_lio_opcode = c_api::IOCB_CMD::PWRITE;
         iocb.aio_buf = unsafe { std::mem::transmute(buf.as_ptr()) };
         iocb.aio_nbytes = buf.size as libc::uint64_t;
         iocb.aio_offset = offset as libc::int64_t;

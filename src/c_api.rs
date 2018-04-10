@@ -59,7 +59,7 @@ pub struct iocb {
     pub aio_reserved1: libc::uint64_t,
 
     // common fields
-    pub aio_lib_opcode: IOCB_CMD,
+    pub aio_lio_opcode: IOCB_CMD,
     pub aio_reqprio: libc::int16_t,
     pub aio_fildes: libc::uint32_t,
 
