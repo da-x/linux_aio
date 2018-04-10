@@ -84,38 +84,13 @@ impl iocb {
     }
 }
 
-mod ffi {
-    use libc;
-    use super::{aio_context_t, iocb, io_event};
-
-    #[link(name = "aio")]
-    extern "C" {
-        pub fn io_setup(nr_events: libc::c_uint, ctx_idp: &mut aio_context_t) -> libc::c_int;
-        pub fn io_destroy(ctx_id: aio_context_t) -> libc::c_int;
-        pub fn io_getevents(ctx_id: aio_context_t,
-                            min_nr: libc::c_long,
-                            nr: libc::c_long,
-                            events: *mut io_event,
-                            timeout: *const libc::timespec)
-                            -> libc::c_int;
-        pub fn io_submit(ctx_id: aio_context_t,
-                         nr: libc::c_long,
-                         iocbp: *const *const iocb)
-                         -> libc::c_int;
-        pub fn io_cancel(ctx_id: aio_context_t,
-                         iocb: *const iocb,
-                         result: *mut io_event)
-                         -> libc::c_int;
-    }
-}
-
 pub fn io_setup(nr_events: libc::c_uint, ctx_idp: &mut aio_context_t) -> IoResult<()> {
-    let result = unsafe { ffi::io_setup(nr_events, ctx_idp) };
+    let result = unsafe { libc::syscall(libc::SYS_io_setup, nr_events, ctx_idp) };
     from_aio_result(result).map(|_| ())
 }
 
 pub fn io_destroy(ctx_id: aio_context_t) -> IoResult<()> {
-    let result = unsafe { ffi::io_destroy(ctx_id) };
+    let result = unsafe { libc::syscall(libc::SYS_io_destroy, ctx_id) };
     from_aio_result(result).map(|_| ())
 }
 
@@ -126,12 +101,13 @@ pub fn io_getevents(ctx_id: aio_context_t,
                     timeout: Option<&libc::timespec>)
                     -> IoResult<usize> {
     let result = unsafe {
-        ffi::io_getevents(ctx_id,
-                          min_nr,
-                          nr,
-                          events,
-                          timeout.map(|x| x as *const libc::timespec)
-                                 .unwrap_or(std::ptr::null()))
+        libc::syscall(libc::SYS_io_getevents,
+                      ctx_id,
+                      min_nr,
+                      nr,
+                      events,
+                      timeout.map(|x| x as *const libc::timespec)
+                      .unwrap_or(std::ptr::null()))
     };
     from_aio_result(result)
 }
@@ -140,18 +116,19 @@ pub fn io_submit(ctx_id: aio_context_t,
                  nr: libc::c_long,
                  iocbp: *const *const iocb)
                  -> IoResult<usize> {
-    let result = unsafe { ffi::io_submit(ctx_id, nr, iocbp) };
+    let result = unsafe { libc::syscall(libc::SYS_io_submit, ctx_id, nr, iocbp) };
     from_aio_result(result)
 }
 
 pub fn io_cancel(ctx_id: aio_context_t, iocb: *const iocb, result: *mut io_event) -> IoResult<()> {
-    let result = unsafe { ffi::io_cancel(ctx_id, iocb, result) };
+    let result = unsafe { libc::syscall(libc::SYS_io_cancel, ctx_id, iocb, result) };
     from_aio_result(result).map(|_| ())
 }
 
-fn from_aio_result(result: libc::c_int) -> IoResult<usize> {
+#[inline]
+fn from_aio_result(result: libc::c_long) -> IoResult<usize> {
     if result < 0 {
-        Err(IoError::from_raw_os_error(-result))
+        Err(IoError::last_os_error())
     } else {
         Ok(result as usize)
     }
