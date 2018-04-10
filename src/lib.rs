@@ -1,5 +1,6 @@
 // Copyright 2016 Takeru Ohta <phjgt308@gmail.com>
 // See the LICENSE file at the top-level directory of this distribution.
+
 extern crate libc;
 
 pub mod c_api;
@@ -70,7 +71,7 @@ impl ControlBlock {
         iocb.aio_fildes = fd as libc::uint32_t;
         iocb.aio_lib_opcode = c_api::IOCB_CMD::PREAD;
         iocb.aio_buf = unsafe { std::mem::transmute(buf.as_mut_ptr()) };
-        iocb.aio_nbytes = buf.capacity as libc::uint64_t;
+        iocb.aio_nbytes = buf.size as libc::uint64_t;
         iocb.aio_offset = offset as libc::int64_t;
         ControlBlock {
             iocb: Box::new(iocb),
@@ -83,7 +84,7 @@ impl ControlBlock {
         iocb.aio_fildes = fd as libc::uint32_t;
         iocb.aio_lib_opcode = c_api::IOCB_CMD::PWRITE;
         iocb.aio_buf = unsafe { std::mem::transmute(buf.as_ptr()) };
-        iocb.aio_nbytes = buf.capacity as libc::uint64_t;
+        iocb.aio_nbytes = buf.size as libc::uint64_t;
         iocb.aio_offset = offset as libc::int64_t;
         ControlBlock {
             iocb: Box::new(iocb),
@@ -273,12 +274,13 @@ mod test {
         let mut context = Context::setup(1).unwrap();
         let f = File::open("/dev/zero").unwrap();
         let raw_fd = f.as_raw_fd();
-        let buf = AlignedBuf::new(100); // TODO: fill elements by 1
+        let buf_size = 100;
+        let buf = AlignedBuf::new(buf_size); // TODO: fill elements by 1
 
         let event_id = context.submit(ControlBlock::pread(raw_fd, buf, 0)).unwrap();
         let event = context.get_events(1, 1, None).unwrap().into_iter().nth(0).unwrap();
         assert_eq!(event_id, event.id);
-        assert_eq!(100, event.result.unwrap());
+        assert_eq!(buf_size, event.result.unwrap());
         assert!(event.buf.unwrap().iter().all(|&x| x == 0));
     }
 
