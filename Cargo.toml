@@ -1,7 +1,9 @@
 [package]
+edition = "2018"
 name = "linux_aio"
 version = "0.0.1"
 authors = ["Takeru Ohta <phjgt308@gmail.com>"]
 
 [dependencies]
 libc = "0.2"
+slab = "0.4"

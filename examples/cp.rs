@@ -69,19 +69,23 @@ fn main() {
                               .expect("Failed to submit a read request");
         offsets.insert(event_id, offset);
     }
+
+    let mut events = vec![];
     while !offsets.is_empty() {
-        for e in context.get_events(1, 4, None).unwrap() {
+        context.get_events(1, Some(4), None, &mut events).unwrap();
+
+        for e in events.drain(..) {
             if let Some(offset) = offsets.remove(&e.id) {
                 // read event
-                let buf = e.buf.unwrap();
+
+                let buf = e.cb.into_buf();
                 context.submit(ControlBlock::pwrite(wf.as_raw_fd(), buf, offset))
                        .expect("Failed to submit a write request");
-
             }
         }
     }
 
     while !context.is_empty() {
-        context.get_events(1, 4, None).unwrap();
+        context.get_events(1, Some(4), None, &mut events).unwrap();
     }
 }

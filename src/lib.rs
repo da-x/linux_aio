@@ -8,9 +8,9 @@ pub mod c_api;
 use std::os::unix::io::RawFd;
 use std::io::Error as IoError;
 use std::time::Duration;
-use std::collections::HashMap;
 use std::ops::Deref;
 use std::ops::DerefMut;
+use slab::Slab;
 
 pub type Result<T> = std::io::Result<T>;
 
@@ -33,11 +33,23 @@ impl AlignedBuf {
                            line!(),
                            IoError::from_raw_os_error(result)));
         }
+
         AlignedBuf {
             ptr: ptr as *mut _,
-            size: size,
+            size,
             capacity: allocate_size,
         }
+    }
+
+    /// Allow to use a smaller amount of space for the I/O itself, even if the
+    /// buffer was allocated bigger.
+    pub fn resize(&mut self, size: usize) -> std::result::Result<(), ()> {
+        if self.capacity < size {
+            return Err(());
+        }
+
+        self.size = size;
+        Ok(())
     }
 }
 
@@ -61,8 +73,8 @@ impl DerefMut for AlignedBuf {
 }
 
 pub struct ControlBlock {
-    iocb: Box<c_api::iocb>,
-    buf: Option<AlignedBuf>,
+    iocb: c_api::iocb,
+    buf: AlignedBuf,
 }
 
 impl ControlBlock {
@@ -73,10 +85,8 @@ impl ControlBlock {
         iocb.aio_buf = unsafe { std::mem::transmute(buf.as_mut_ptr()) };
         iocb.aio_nbytes = buf.size as libc::uint64_t;
         iocb.aio_offset = offset as libc::int64_t;
-        ControlBlock {
-            iocb: Box::new(iocb),
-            buf: Some(buf),
-        }
+
+        ControlBlock { iocb, buf }
     }
 
     pub fn pwrite(fd: RawFd, buf: AlignedBuf, offset: usize) -> Self {
@@ -86,10 +96,8 @@ impl ControlBlock {
         iocb.aio_buf = unsafe { std::mem::transmute(buf.as_ptr()) };
         iocb.aio_nbytes = buf.size as libc::uint64_t;
         iocb.aio_offset = offset as libc::int64_t;
-        ControlBlock {
-            iocb: Box::new(iocb),
-            buf: Some(buf),
-        }
+
+        ControlBlock { iocb, buf }
     }
 
     pub fn eventfd(mut self, fd: RawFd) -> Self {
@@ -97,134 +105,113 @@ impl ControlBlock {
         self.iocb.aio_resfd = fd as libc::uint32_t;
         self
     }
+
+    pub fn into_buf(self) -> AlignedBuf {
+        self.buf
+    }
 }
 
 pub struct Context {
     context_id: c_api::aio_context_t,
-    next_id: EventId,
-    submitted: HashMap<EventId, ControlBlock>,
-    executed: HashMap<EventId, Event>,
+    nr_events: usize,
+    pending_events: Slab<ControlBlock>,
+    ended_events: Vec<c_api::io_event>,
 }
 
 impl Context {
-    pub fn is_empty(&self) -> bool {
-        self.submitted.is_empty() && self.executed.is_empty()
-    }
-
     pub fn setup(nr_events: usize) -> Result<Self> {
         let mut context_id = 0;
+
         c_api::io_setup(nr_events as libc::c_uint, &mut context_id).map(|_| {
             Context {
-                context_id: context_id,
-                next_id: 1,
-                submitted: HashMap::new(),
-                executed: HashMap::new(),
+                pending_events: Slab::with_capacity(nr_events),
+                context_id,
+                nr_events,
+                ended_events: vec![c_api::io_event::zeroed(); nr_events],
             }
         })
     }
 
-    pub fn submit(&mut self, mut cb: ControlBlock) -> Result<EventId> {
-        let event_id = self.next_id;
-        cb.iocb.aio_data = event_id as libc::uint64_t;
+    pub fn is_empty(&self) -> bool {
+        self.pending_events.is_empty()
+    }
 
-        let iocbp = cb.iocb.as_ref() as *const _;
-        c_api::io_submit(self.context_id, 1, &iocbp).map(|count| {
-            assert_eq!(1, count);
-            self.next_id = self.next_id.wrapping_add(1);
-            self.submitted.insert(event_id, cb);
-            event_id
-        })
+    pub fn submit(&mut self, cb: ControlBlock) -> Result<EventId> {
+        let entry = self.pending_events.vacant_entry();
+        let key = entry.key();
+
+        let event = entry.insert(cb);
+        event.iocb.aio_data = key as libc::uint64_t;
+
+        // NOTE: Assuming that Slab will not change addresses of contained
+        // objects, as we are passing the pointer to the iocb!
+        let iocbp = &event.iocb as *const _;
+        c_api::io_submit(self.context_id, 1, &iocbp).map(|_| key)
     }
 
     pub fn get_events(&mut self,
                       min_nr: usize,
-                      nr: usize,
-                      timeout: Option<Duration>)
-                      -> Result<Vec<Event>> {
-        let prefetched_ids: Vec<_> = self.executed.keys().cloned().take(nr).collect();
-        let mut events = Vec::with_capacity(prefetched_ids.len());
-        for id in prefetched_ids {
-            let event = self.executed.remove(&id).unwrap();
-            events.push(event);
-        }
-        if events.len() == nr {
-            return Ok(events);
-        }
-
-        let nr = nr - events.len();
-        let min_nr = if min_nr > events.len() {
-            min_nr - events.len()
-        } else {
-            0
-        };
-        let mut io_events = vec![c_api::io_event::zeroed(); nr];
+                      max_nr: Option<usize>,
+                      timeout: Option<Duration>,
+                      out_events: &mut Vec<Event>) -> Result<()>
+    {
+        let max_nr = max_nr.unwrap_or(self.nr_events);
         let c_timeout = timeout.map(|t| {
             libc::timespec {
                 tv_sec: t.as_secs() as libc::time_t,
                 tv_nsec: t.subsec_nanos() as libc::c_long,
             }
         });
+
+        out_events.clear();
+
         match c_api::io_getevents(self.context_id,
                                   min_nr as libc::c_long,
-                                  nr as libc::c_long,
-                                  io_events.as_mut_ptr(),
+                                  max_nr as libc::c_long,
+                                  self.ended_events.as_mut_ptr(),
                                   c_timeout.as_ref()) {
-            Err(reason) => {
-                if events.is_empty() {
-                    Err(reason)
-                } else {
-                    Ok(events)
-                }
-            }
+            Err(reason) => Err(reason),
             Ok(count) => {
-                for e in &io_events[0..count] {
+                for e in &self.ended_events[0 .. count] {
                     let event_id = e.data as EventId;
-                    let cb = self.submitted.remove(&event_id).unwrap();
-                    events.push(Event::new(e, cb))
-                }
-                Ok(events)
-            }
-        }
-    }
-
-    pub fn cancel(&mut self, event_id: EventId) -> Result<Option<Event>> {
-        if let Some(event) = self.executed.remove(&event_id) {
-            return Ok(Some(event));
-        }
-
-        if let Some(cb) = self.submitted.remove(&event_id) {
-            // NOTE: io_cancel(2) may not work (always return EINVAL)
-            let mut result = c_api::io_event::zeroed();
-            match c_api::io_cancel(self.context_id, cb.iocb.as_ref(), &mut result) {
-                Ok(_) => Ok(Some(Event::new(&result, cb))),
-                Err(reason) => {
-                    self.submitted.insert(event_id, cb);
-
-                    self.fetch_events();
-                    if let Some(event) = self.executed.remove(&event_id) {
-                        return Ok(Some(event));
+                    if !self.pending_events.contains(event_id) {
+                        panic!("unqueued event {} returned", event_id);
                     }
-                    Err(reason)
+                    let cb = self.pending_events.remove(event_id);
+                    out_events.push(Event::new(e, cb))
                 }
+
+                Ok(())
             }
-        } else {
-            Ok(None)
         }
     }
 
-    fn fetch_events(&mut self) {
-        let max_events = self.submitted.len();
-        for e in self.get_events(0, max_events, None).unwrap_or(vec![]) {
-            self.executed.insert(e.id, e);
-        }
+    pub fn cancel(&mut self, event_id: EventId) -> Result<ControlBlock> {
+        let iocbp = {
+            let event = self.pending_events.get(event_id)
+                .expect(&format!("event Id {} not queued", event_id));
+
+            &event.iocb as *const _
+        };
+
+        let mut result = c_api::io_event::zeroed();
+
+        // On Linux, 4.19 this is an O(n) operation over the number of
+        // active I/Os, and it returns EINVAL if the I/O is not the list,
+        // found by finding the iocbp user space pointer.
+
+        c_api::io_cancel(self.context_id, iocbp, &mut result)?;
+
+        Ok(self.pending_events.remove(event_id))
     }
 }
 
 impl Drop for Context {
     fn drop(&mut self) {
-        let event_ids = self.submitted.keys().cloned().collect::<Vec<_>>();
-        for event_id in event_ids.into_iter() {
-            let _ = self.cancel(event_id);
+        for event in self.pending_events.iter_mut() {
+            let iocbp = &event.1.iocb as *const _;
+            let mut result = c_api::io_event::zeroed();
+            let _ = c_api::io_cancel(self.context_id, iocbp, &mut result);
         }
         c_api::io_destroy(self.context_id).unwrap();
     }
@@ -234,21 +221,22 @@ pub type EventId = usize;
 
 pub struct Event {
     pub id: EventId,
-    pub buf: Option<AlignedBuf>,
+    pub cb: ControlBlock,
     pub result: Result<usize>,
 }
 
 impl Event {
-    fn new(e: &c_api::io_event, mut cb: ControlBlock) -> Self {
+    fn new(e: &c_api::io_event, cb: ControlBlock) -> Self {
         let event_id = e.data as EventId;
         let result = if e.res < 0 {
             Err(IoError::from_raw_os_error(-e.res as i32))
         } else {
             Ok(e.res as usize)
         };
+
         Event {
             id: event_id,
-            buf: cb.buf.take(),
+            cb,
             result: result,
         }
     }
@@ -265,7 +253,8 @@ mod test {
     #[test]
     fn it_works() {
         let mut ctx = Context::setup(1).unwrap();
-        let events = ctx.get_events(0, 0, None).unwrap();
+        let mut events = vec![];
+        ctx.get_events(0, None, None, &mut events).unwrap();
         assert_eq!(0, events.len());
     }
 
@@ -278,10 +267,12 @@ mod test {
         let buf = AlignedBuf::new(buf_size); // TODO: fill elements by 1
 
         let event_id = context.submit(ControlBlock::pread(raw_fd, buf, 0)).unwrap();
-        let event = context.get_events(1, 1, None).unwrap().into_iter().nth(0).unwrap();
+        let mut events = vec![];
+        context.get_events(1, Some(1), None, &mut events).unwrap();
+        let event = events.into_iter().nth(0).unwrap();
         assert_eq!(event_id, event.id);
         assert_eq!(buf_size, event.result.unwrap());
-        assert!(event.buf.unwrap().iter().all(|&x| x == 0));
+        assert!(event.cb.buf.iter().all(|&x| x == 0));
     }
 
     #[test]
@@ -296,6 +287,10 @@ mod test {
         let buf = AlignedBuf::new(100);
 
         let event_id = context.submit(ControlBlock::pread(raw_fd, buf, 0)).unwrap();
-        context.cancel(event_id).expect("Failed to cancel");
+
+        // Unless we can prevent the kernel from performing the I/OS somehow before
+        // we manage to call 'cancel', this test cannot determine the return value
+        // of cancel.
+        let _ = context.cancel(event_id);
     }
 }
