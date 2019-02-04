@@ -51,6 +51,10 @@ impl AlignedBuf {
         self.size = size;
         Ok(())
     }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
 }
 
 impl Drop for AlignedBuf {
