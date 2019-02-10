@@ -110,6 +110,29 @@ impl ControlBlock {
         self
     }
 
+    #[inline]
+    pub fn get_buf(&self) -> &AlignedBuf {
+        &self.buf
+    }
+
+    #[inline]
+    pub fn is_write(&self) -> bool {
+        match self.iocb.aio_lio_opcode {
+            c_api::IOCB_CMD::PWRITE => true,
+            _ => false,
+        }
+    }
+
+    #[inline]
+    pub fn offset(&self) -> u64 {
+        self.iocb.aio_offset as u64
+    }
+
+    #[inline]
+    pub fn size(&self) -> u64 {
+        self.iocb.aio_nbytes
+    }
+
     pub fn into_buf(self) -> AlignedBuf {
         self.buf
     }
